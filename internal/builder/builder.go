@@ -387,7 +387,14 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound, error) {
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
-		return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
+		normalizedURI, normalized := normalizeHysteria2PortHoppingURI(rawURI)
+		if !normalized {
+			return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
+		}
+		parsed, err = url.Parse(normalizedURI)
+		if err != nil {
+			return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
+		}
 	}
 	switch strings.ToLower(parsed.Scheme) {
 	case "vless":
@@ -497,14 +504,33 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 
 func buildHysteria2Options(u *url.URL, skipCertVerify bool) (option.Hysteria2OutboundOptions, error) {
 	password := u.User.String()
-	server, port, err := hostPort(u, 443)
+	server, port, hopPorts, err := hysteria2HostPort(u, 443)
 	if err != nil {
 		return option.Hysteria2OutboundOptions{}, err
 	}
 	query := u.Query()
+	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("ports"))...)
+	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("server_ports"))...)
+	hopPorts = appendUniqueStrings(hopPorts, parseHysteria2Ports(query.Get("mport"))...)
 	opts := option.Hysteria2OutboundOptions{
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
 		Password:      password,
+	}
+	if len(hopPorts) > 0 {
+		opts.ServerPorts = badoption.Listable[string](hopPorts)
+	}
+	if hopInterval := query.Get("hop_interval"); hopInterval != "" {
+		d, err := time.ParseDuration(hopInterval)
+		if err != nil {
+			return option.Hysteria2OutboundOptions{}, fmt.Errorf("invalid hop_interval %q", hopInterval)
+		}
+		opts.HopInterval = badoption.Duration(d)
+	} else if hopInterval := query.Get("hopInterval"); hopInterval != "" {
+		d, err := time.ParseDuration(hopInterval)
+		if err != nil {
+			return option.Hysteria2OutboundOptions{}, fmt.Errorf("invalid hopInterval %q", hopInterval)
+		}
+		opts.HopInterval = badoption.Duration(d)
 	}
 	if up := query.Get("upMbps"); up != "" {
 		opts.UpMbps = atoiDefault(up)
@@ -1062,6 +1088,154 @@ func hostPort(u *url.URL, defaultPort int) (string, int, error) {
 		return "", 0, fmt.Errorf("invalid port %q", portStr)
 	}
 	return host, port, nil
+}
+
+func normalizeHysteria2PortHoppingURI(rawURI string) (string, bool) {
+	lowerURI := strings.ToLower(rawURI)
+	if !strings.HasPrefix(lowerURI, "hysteria2://") && !strings.HasPrefix(lowerURI, "hy2://") {
+		return "", false
+	}
+
+	schemeSep := strings.Index(rawURI, "://")
+	if schemeSep == -1 {
+		return "", false
+	}
+
+	scheme := rawURI[:schemeSep]
+	rest := rawURI[schemeSep+3:]
+
+	fragment := ""
+	if idx := strings.Index(rest, "#"); idx != -1 {
+		fragment = rest[idx:]
+		rest = rest[:idx]
+	}
+
+	rawQuery := ""
+	if idx := strings.Index(rest, "?"); idx != -1 {
+		rawQuery = rest[idx+1:]
+		rest = rest[:idx]
+	}
+
+	atIdx := strings.LastIndex(rest, "@")
+	if atIdx == -1 {
+		return "", false
+	}
+	userInfo := rest[:atIdx]
+	hostPort := rest[atIdx+1:]
+
+	portSep := strings.LastIndex(hostPort, ":")
+	if portSep == -1 {
+		return "", false
+	}
+	host := hostPort[:portSep]
+	rawPort := strings.TrimSpace(hostPort[portSep+1:])
+	if host == "" || rawPort == "" {
+		return "", false
+	}
+
+	if _, err := strconv.Atoi(rawPort); err == nil {
+		return "", false
+	}
+	if !looksLikeHysteria2PortSet(rawPort) {
+		return "", false
+	}
+
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		values = url.Values{}
+	}
+	if strings.TrimSpace(values.Get("ports")) == "" && strings.TrimSpace(values.Get("server_ports")) == "" && strings.TrimSpace(values.Get("mport")) == "" {
+		values.Set("ports", rawPort)
+	}
+
+	normalizedURI := fmt.Sprintf("%s://%s@%s:%d", scheme, userInfo, host, 443)
+	if encoded := values.Encode(); encoded != "" {
+		normalizedURI += "?" + encoded
+	}
+	normalizedURI += fragment
+
+	return normalizedURI, true
+}
+
+func looksLikeHysteria2PortSet(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		if (r >= '0' && r <= '9') || r == '-' || r == ',' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func hysteria2HostPort(u *url.URL, defaultPort int) (string, int, []string, error) {
+	host := u.Hostname()
+	if host == "" {
+		return "", 0, nil, errors.New("missing host")
+	}
+
+	port := defaultPort
+	var hopPorts []string
+	rawPort := strings.TrimSpace(u.Port())
+	if rawPort == "" {
+		return host, port, hopPorts, nil
+	}
+
+	if numericPort, err := strconv.Atoi(rawPort); err == nil {
+		return host, numericPort, hopPorts, nil
+	}
+
+	hopPorts = append(hopPorts, rawPort)
+	return host, port, hopPorts, nil
+}
+
+func parseHysteria2Ports(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	ports := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			ports = append(ports, normalizeHysteria2PortRange(part))
+		}
+	}
+	return ports
+}
+
+func normalizeHysteria2PortRange(portRange string) string {
+	if strings.Contains(portRange, ":") {
+		return portRange
+	}
+	if strings.Count(portRange, "-") == 1 {
+		return strings.Replace(portRange, "-", ":", 1)
+	}
+	return portRange
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	if len(values) == 0 {
+		return base
+	}
+	seen := make(map[string]struct{}, len(base))
+	for _, item := range base {
+		seen[item] = struct{}{}
+	}
+	for _, item := range values {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		base = append(base, item)
+	}
+	return base
 }
 
 // normalizeShadowsocksMethod maps common Shadowsocks method aliases to the

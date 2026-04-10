@@ -31,7 +31,7 @@ type Config struct {
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
+	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
 
@@ -731,6 +731,7 @@ type clashProxy struct {
 	Type              string                 `yaml:"type"`
 	Server            string                 `yaml:"server"`
 	Port              int                    `yaml:"port"`
+	Ports             string                 `yaml:"ports"`
 	UUID              string                 `yaml:"uuid"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
@@ -746,12 +747,14 @@ type clashProxy struct {
 	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
 	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
 	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Obfs              string                 `yaml:"obfs"`
+	ObfsPassword      string                 `yaml:"obfs-password"`
 	Plugin            string                 `yaml:"plugin"`
 	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 	// TUIC-specific fields
-	ALPN                []string `yaml:"alpn"`
-	CongestionController string  `yaml:"congestion-controller"`
-	UDPRelayMode        string   `yaml:"udp-relay-mode"`
+	ALPN                 []string `yaml:"alpn"`
+	CongestionController string   `yaml:"congestion-controller"`
+	UDPRelayMode         string   `yaml:"udp-relay-mode"`
 }
 
 type clashWSOptions struct {
@@ -963,13 +966,54 @@ func buildHysteria2URI(p clashProxy) string {
 	if p.SkipCertVerify {
 		params.Set("insecure", "1")
 	}
+	if p.Obfs != "" {
+		params.Set("obfs", p.Obfs)
+		if p.ObfsPassword != "" {
+			params.Set("obfs-password", p.ObfsPassword)
+		}
+	}
+	if strings.TrimSpace(p.Ports) != "" {
+		params.Set("ports", normalizeHysteria2PortsValue(strings.TrimSpace(p.Ports)))
+	}
 
 	query := ""
 	if len(params) > 0 {
 		query = "?" + params.Encode()
 	}
 
-	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+	port := p.Port
+	if port <= 0 {
+		port = 443
+	}
+
+	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, port, query, url.QueryEscape(p.Name))
+}
+
+func normalizeHysteria2PortsValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	parts := strings.Split(value, ",")
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if strings.Contains(part, ":") {
+			normalized = append(normalized, part)
+			continue
+		}
+		if strings.Count(part, "-") == 1 {
+			normalized = append(normalized, strings.Replace(part, "-", ":", 1))
+			continue
+		}
+		normalized = append(normalized, part)
+	}
+
+	return strings.Join(normalized, ",")
 }
 
 func buildTUICURI(p clashProxy) string {
