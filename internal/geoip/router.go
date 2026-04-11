@@ -73,7 +73,7 @@ func (r *Router) Start(ctx context.Context) error {
 
 	go func() {
 		r.logger.Printf("🌐 GeoIP Router started on %s", addr)
-		r.logger.Println("   Routes: /jp, /kr, /us, /hk, /tw, /other (default: all nodes)")
+		r.logger.Println("   Routes: /jp, /kr, /us, /hk, /tw, /sg, /other (default: all nodes)")
 		if err := r.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			r.logger.Printf("GeoIP router error: %v", err)
 		}

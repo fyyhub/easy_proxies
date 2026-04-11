@@ -360,8 +360,15 @@ func (m *Manager) startGeoIPRouter(ctx context.Context, cfg *config.Config) {
 
 	geoipPort := cfg.GeoIP.Port
 	if geoipPort == 0 {
-		// Default to listener port — GeoIP router replaces the sing-box pool inbound
-		geoipPort = cfg.Listener.Port
+		geoipPort = 1221 // Default GeoIP router port
+	}
+	// Avoid conflict with the pool listener port
+	if geoipPort == cfg.Listener.Port {
+		geoipPort = 1221
+		if geoipPort == cfg.Listener.Port {
+			geoipPort = cfg.Listener.Port + 1
+		}
+		log.Printf("⚠️  GeoIP port conflicts with listener port %d, using %d instead", cfg.Listener.Port, geoipPort)
 	}
 	geoipListen := cfg.GeoIP.Listen
 	if geoipListen == "" {

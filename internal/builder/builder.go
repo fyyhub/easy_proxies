@@ -223,15 +223,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Build pool inbound (single entry point for all nodes)
 	if enablePoolInbound {
-		// When GeoIP is enabled, the GeoIP router takes over the listener port,
-		// so we skip creating the sing-box pool inbound to avoid port conflict.
-		if !cfg.GeoIP.Enabled {
-			inbound, err := buildPoolInbound(cfg)
-			if err != nil {
-				return option.Options{}, err
-			}
-			inbounds = append(inbounds, inbound)
+		inbound, err := buildPoolInbound(cfg)
+		if err != nil {
+			return option.Options{}, err
 		}
+		inbounds = append(inbounds, inbound)
 		poolOptions := poolout.Options{
 			Mode:              cfg.Pool.Mode,
 			Members:           memberTags,
@@ -337,7 +333,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		// Log GeoIP routing info
 		geoipPort := cfg.GeoIP.Port
 		if geoipPort == 0 {
-			geoipPort = cfg.Listener.Port
+			geoipPort = 1221 // Default GeoIP router port
 		}
 		geoipListen := cfg.GeoIP.Listen
 		if geoipListen == "" {
@@ -345,7 +341,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 		log.Println("🌐 GeoIP Region Routing Enabled:")
 		log.Printf("   Access via: http://%s:%d/{region}", geoipListen, geoipPort)
-		log.Println("   Available regions: /jp, /kr, /us, /hk, /tw, /other")
+		log.Println("   Available regions: /jp, /kr, /us, /hk, /tw, /sg, /other")
 		log.Println("   Default (no path): all nodes pool")
 	}
 
