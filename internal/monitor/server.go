@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -157,11 +158,28 @@ func (s *Server) SetConfig(cfg *config.Config) {
 	}
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
+	// Preserve subscription config from previous cfgSrc if new config has none
+	if cfg != nil && s.cfgSrc != nil {
+		if len(cfg.Subscriptions) == 0 && len(s.cfgSrc.Subscriptions) > 0 {
+			cfg.Subscriptions = s.cfgSrc.Subscriptions
+		}
+		if cfg.SubscriptionRefresh.Interval == 0 && s.cfgSrc.SubscriptionRefresh.Interval > 0 {
+			cfg.SubscriptionRefresh = s.cfgSrc.SubscriptionRefresh
+		}
+	}
 	s.cfgSrc = cfg
 	if cfg != nil {
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
+		// Sync proxy credentials based on mode
+		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+			s.cfg.ProxyUsername = cfg.MultiPort.Username
+			s.cfg.ProxyPassword = cfg.MultiPort.Password
+		} else {
+			s.cfg.ProxyUsername = cfg.Listener.Username
+			s.cfg.ProxyPassword = cfg.Listener.Password
+		}
 	}
 }
 
@@ -634,7 +652,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 //   - scheme=http   (默认)
 //   - scheme=socks5
 //   - scheme=all    (同时导出 HTTP 和 SOCKS5)
-// 在 hybrid 模式下，只导出 multi-port 格式（每节点独立端口）。
+//
+// 在 pool/hybrid 模式下，还会导出 Pool 代理池入口和 GeoIP 分区路由入口。
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -655,14 +674,88 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	snapshots := s.mgr.SnapshotFiltered(true)
 	var lines []string
 
+	seen := make(map[string]bool)
+
+	// 读取运行模式和监听配置
+	s.cfgMu.RLock()
+	mode := ""
+	var listenerCfg config.ListenerConfig
+	var geoipCfg config.GeoIPConfig
+	if s.cfgSrc != nil {
+		mode = s.cfgSrc.Mode
+		listenerCfg = s.cfgSrc.Listener
+		geoipCfg = s.cfgSrc.GeoIP
+	}
+	s.cfgMu.RUnlock()
+
+	// Pool 代理池入口（pool 或 hybrid 模式）
+	if (mode == "pool" || mode == "hybrid") && listenerCfg.Port > 0 {
+		poolAddr := listenerCfg.Address
+		if poolAddr == "" || poolAddr == "0.0.0.0" || poolAddr == "::" {
+			if extIP, _, _, _ := s.getSettings(); extIP != "" {
+				poolAddr = extIP
+			}
+		}
+		var poolAuth string
+		if listenerCfg.Username != "" && listenerCfg.Password != "" {
+			poolAuth = fmt.Sprintf("%s:%s@", listenerCfg.Username, listenerCfg.Password)
+		}
+		lines = append(lines, "# Pool 代理池入口")
+		poolHTTP := fmt.Sprintf("http://%s%s:%d", poolAuth, poolAddr, listenerCfg.Port)
+		poolSocks := fmt.Sprintf("socks5://%s%s:%d", poolAuth, poolAddr, listenerCfg.Port)
+		switch scheme {
+		case "http":
+			lines = append(lines, poolHTTP)
+			seen[poolHTTP] = true
+		case "socks5":
+			lines = append(lines, poolSocks)
+			seen[poolSocks] = true
+		case "all":
+			lines = append(lines, poolHTTP)
+			seen[poolHTTP] = true
+			lines = append(lines, poolSocks)
+			seen[poolSocks] = true
+		}
+	}
+
+	// GeoIP 分区路由入口
+	if geoipCfg.Enabled && geoipCfg.Port > 0 {
+		geoAddr := geoipCfg.Listen
+		if geoAddr == "" || geoAddr == "0.0.0.0" || geoAddr == "::" {
+			if extIP, _, _, _ := s.getSettings(); extIP != "" {
+				geoAddr = extIP
+			}
+		}
+		var geoAuth string
+		if listenerCfg.Username != "" && listenerCfg.Password != "" {
+			geoAuth = fmt.Sprintf("%s:%s@", listenerCfg.Username, listenerCfg.Password)
+		}
+		regions := geoip.AllRegions()
+		var pathParts []string
+		for _, r := range regions {
+			if r != "other" {
+				pathParts = append(pathParts, fmt.Sprintf("/%s/", r))
+			}
+		}
+		lines = append(lines, fmt.Sprintf("# GeoIP 分区路由入口 (支持路径: %s)", strings.Join(pathParts, " ")))
+		// GeoIP 路由仅支持 HTTP
+		geoURI := fmt.Sprintf("http://%s%s:%d", geoAuth, geoAddr, geoipCfg.Port)
+		if !seen[geoURI] {
+			lines = append(lines, geoURI)
+			seen[geoURI] = true
+		}
+	}
+
+	// Multi-port 独立节点
+	if len(snapshots) > 0 && (mode == "hybrid" || mode == "multi-port" || mode == "") {
+		lines = append(lines, "# Multi-port 独立节点")
+	}
 	for _, snap := range snapshots {
 		// 只导出有监听地址和端口的节点
 		if snap.ListenAddress == "" || snap.Port == 0 {
 			continue
 		}
 
-		// 在 hybrid 和 multi-port 模式下，导出每节点独立端口
-		// 在 pool 模式下，所有节点共享同一端口，也正常导出
 		listenAddr := snap.ListenAddress
 		if listenAddr == "0.0.0.0" || listenAddr == "::" {
 			if extIP, _, _, _ := s.getSettings(); extIP != "" {
@@ -679,11 +772,24 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 		switch scheme {
 		case "http":
-			lines = append(lines, httpURI)
+			if !seen[httpURI] {
+				lines = append(lines, httpURI)
+				seen[httpURI] = true
+			}
 		case "socks5":
-			lines = append(lines, socksURI)
+			if !seen[socksURI] {
+				lines = append(lines, socksURI)
+				seen[socksURI] = true
+			}
 		case "all":
-			lines = append(lines, httpURI, socksURI)
+			if !seen[httpURI] {
+				lines = append(lines, httpURI)
+				seen[httpURI] = true
+			}
+			if !seen[socksURI] {
+				lines = append(lines, socksURI)
+				seen[socksURI] = true
+			}
 		}
 	}
 
@@ -704,15 +810,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		extIP, probeTarget, skipCertVerify, logCfg := s.getSettings()
-		var geoipEnabled bool
-		var geoipDBPath string
+
+		// Read full config for extended fields
 		s.cfgMu.RLock()
-		if s.cfgSrc != nil {
-			geoipEnabled = s.cfgSrc.GeoIP.Enabled
-			geoipDBPath = s.cfgSrc.GeoIP.DatabasePath
-		}
+		cfg := s.cfgSrc
 		s.cfgMu.RUnlock()
-		writeJSON(w, map[string]any{
+
+		resp := map[string]any{
 			"external_ip":      extIP,
 			"probe_target":     probeTarget,
 			"skip_cert_verify": skipCertVerify,
@@ -725,16 +829,75 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"compress":    logCfg.Compress,
 			},
 			"geoip": map[string]any{
-				"enabled":       geoipEnabled,
-				"database_path": geoipDBPath,
+				"enabled":              false,
+				"database_path":        "",
+				"listen":               "",
+				"port":                 0,
+				"auto_update_enabled":  false,
+				"auto_update_interval": "",
 			},
-		})
+		}
+		if cfg != nil {
+			resp["mode"] = cfg.Mode
+			resp["listener"] = map[string]any{
+				"address":  cfg.Listener.Address,
+				"port":     cfg.Listener.Port,
+				"username": cfg.Listener.Username,
+				"password": cfg.Listener.Password,
+			}
+			resp["multi_port"] = map[string]any{
+				"address":   cfg.MultiPort.Address,
+				"base_port": cfg.MultiPort.BasePort,
+				"username":  cfg.MultiPort.Username,
+				"password":  cfg.MultiPort.Password,
+			}
+			resp["pool"] = map[string]any{
+				"mode":               cfg.Pool.Mode,
+				"failure_threshold":  cfg.Pool.FailureThreshold,
+				"blacklist_duration": cfg.Pool.BlacklistDuration.String(),
+			}
+			resp["management"] = map[string]any{
+				"listen":   cfg.Management.Listen,
+				"password": cfg.Management.Password,
+			}
+			resp["geoip"] = map[string]any{
+				"enabled":              cfg.GeoIP.Enabled,
+				"database_path":        cfg.GeoIP.DatabasePath,
+				"listen":               cfg.GeoIP.Listen,
+				"port":                 cfg.GeoIP.Port,
+				"auto_update_enabled":  cfg.GeoIP.AutoUpdateEnabled,
+				"auto_update_interval": cfg.GeoIP.AutoUpdateInterval.String(),
+			}
+		}
+		writeJSON(w, resp)
 	case http.MethodPut:
 		var req struct {
 			ExternalIP     string `json:"external_ip"`
 			ProbeTarget    string `json:"probe_target"`
 			SkipCertVerify bool   `json:"skip_cert_verify"`
-			Log            *struct {
+			Mode           string `json:"mode,omitempty"`
+			Listener       *struct {
+				Address  string `json:"address"`
+				Port     uint16 `json:"port"`
+				Username string `json:"username"`
+				Password string `json:"password"`
+			} `json:"listener,omitempty"`
+			MultiPort *struct {
+				Address  string `json:"address"`
+				BasePort uint16 `json:"base_port"`
+				Username string `json:"username"`
+				Password string `json:"password"`
+			} `json:"multi_port,omitempty"`
+			Pool *struct {
+				Mode              string `json:"mode"`
+				FailureThreshold  int    `json:"failure_threshold"`
+				BlacklistDuration string `json:"blacklist_duration"`
+			} `json:"pool,omitempty"`
+			Management *struct {
+				Listen   string `json:"listen"`
+				Password string `json:"password"`
+			} `json:"management,omitempty"`
+			Log *struct {
 				Output     string `json:"output"`
 				MaxSize    int    `json:"max_size"`
 				MaxBackups int    `json:"max_backups"`
@@ -742,7 +905,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				Compress   bool   `json:"compress"`
 			} `json:"log"`
 			GeoIP *struct {
-				Enabled bool `json:"enabled"`
+				Enabled            bool   `json:"enabled"`
+				DatabasePath       string `json:"database_path"`
+				Listen             string `json:"listen"`
+				Port               uint16 `json:"port"`
+				AutoUpdateEnabled  bool   `json:"auto_update_enabled"`
+				AutoUpdateInterval string `json:"auto_update_interval"`
 			} `json:"geoip"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -770,6 +938,53 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
+
+
+		// Update extended settings
+		s.cfgMu.Lock()
+		if s.cfgSrc != nil {
+			if req.Mode != "" {
+				s.cfgSrc.Mode = req.Mode
+			}
+			if req.Listener != nil {
+				s.cfgSrc.Listener.Address = req.Listener.Address
+				s.cfgSrc.Listener.Port = req.Listener.Port
+				s.cfgSrc.Listener.Username = req.Listener.Username
+				s.cfgSrc.Listener.Password = req.Listener.Password
+			}
+			if req.MultiPort != nil {
+				s.cfgSrc.MultiPort.Address = req.MultiPort.Address
+				s.cfgSrc.MultiPort.BasePort = req.MultiPort.BasePort
+				s.cfgSrc.MultiPort.Username = req.MultiPort.Username
+				s.cfgSrc.MultiPort.Password = req.MultiPort.Password
+			}
+			if req.Pool != nil {
+				s.cfgSrc.Pool.Mode = req.Pool.Mode
+				s.cfgSrc.Pool.FailureThreshold = req.Pool.FailureThreshold
+				if req.Pool.BlacklistDuration != "" {
+					if d, err := time.ParseDuration(req.Pool.BlacklistDuration); err == nil {
+						s.cfgSrc.Pool.BlacklistDuration = d
+					}
+				}
+			}
+			if req.Management != nil {
+				s.cfgSrc.Management.Listen = req.Management.Listen
+				s.cfgSrc.Management.Password = req.Management.Password
+			}
+			if req.GeoIP != nil {
+				s.cfgSrc.GeoIP.DatabasePath = req.GeoIP.DatabasePath
+				s.cfgSrc.GeoIP.Listen = req.GeoIP.Listen
+				s.cfgSrc.GeoIP.Port = req.GeoIP.Port
+				s.cfgSrc.GeoIP.AutoUpdateEnabled = req.GeoIP.AutoUpdateEnabled
+				if req.GeoIP.AutoUpdateInterval != "" {
+					if d, err := time.ParseDuration(req.GeoIP.AutoUpdateInterval); err == nil {
+						s.cfgSrc.GeoIP.AutoUpdateInterval = d
+					}
+				}
+			}
+			_ = s.cfgSrc.SaveSettings()
+		}
+		s.cfgMu.Unlock()
 
 		writeJSON(w, map[string]any{
 			"message":          "设置已保存",
